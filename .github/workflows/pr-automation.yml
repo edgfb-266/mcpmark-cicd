@@ -1,0 +1,505 @@
+name: Pull Request Automation
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  code-quality:
+    name: code-quality
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run ESLint
+        id: eslint
+        run: |
+          echo "ESLINT_OUTPUT<<EOF" >> $GITHUB_ENV
+          npm run lint 2>&1 | tee eslint-output.txt || true
+          cat eslint-output.txt >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+          npm run lint && echo "ESLINT_STATUS=✅ Passed" >> $GITHUB_ENV || echo "ESLINT_STATUS=❌ Failed" >> $GITHUB_ENV
+        continue-on-error: true
+
+      - name: Run Prettier Check
+        id: prettier
+        run: |
+          echo "PRETTIER_OUTPUT<<EOF" >> $GITHUB_ENV
+          npx prettier --check "src/**/*.js" 2>&1 | tee prettier-output.txt || true
+          cat prettier-output.txt >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+          npx prettier --check "src/**/*.js" && echo "PRETTIER_STATUS=✅ Passed" >> $GITHUB_ENV || echo "PRETTIER_STATUS=❌ Failed" >> $GITHUB_ENV
+        continue-on-error: true
+
+      - name: Post Code Quality Report
+        uses: actions/github-script@v7
+        if: always()
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const eslintStatus = process.env.ESLINT_STATUS || '⚠️ Unknown';
+            const prettierStatus = process.env.PRETTIER_STATUS || '⚠️ Unknown';
+            const eslintOutput = process.env.ESLINT_OUTPUT || 'No output captured';
+            const prettierOutput = process.env.PRETTIER_OUTPUT || 'No output captured';
+            
+            const body = `## 📋 Code Quality Report
+            
+            ### ESLint Results
+            **Status:** ${eslintStatus}
+            
+            <details>
+            <summary>View ESLint Output</summary>
+            
+            \`\`\`
+            ${eslintOutput}
+            \`\`\`
+            </details>
+            
+            ### Prettier Formatting
+            **Status:** ${prettierStatus}
+            
+            <details>
+            <summary>View Prettier Output</summary>
+            
+            \`\`\`
+            ${prettierOutput}
+            \`\`\`
+            </details>
+            
+            ---
+            *Automated code quality checks completed*
+            `;
+            
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: body
+            });
+
+  testing-suite:
+    name: testing-suite
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run Tests with Coverage
+        id: test
+        run: |
+          npm run test:coverage 2>&1 | tee test-output.txt || true
+          echo "TEST_OUTPUT<<EOF" >> $GITHUB_ENV
+          cat test-output.txt >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+          npm test && echo "TEST_STATUS=✅ Passed" >> $GITHUB_ENV || echo "TEST_STATUS=❌ Failed" >> $GITHUB_ENV
+        continue-on-error: true
+
+      - name: Extract Coverage Summary
+        id: coverage
+        if: always()
+        run: |
+          if [ -f coverage/coverage-summary.json ]; then
+            echo "COVERAGE_AVAILABLE=true" >> $GITHUB_ENV
+            # Extract coverage percentages
+            LINES=$(cat coverage/coverage-summary.json | grep -o '"lines":{"total":[0-9]*,"covered":[0-9]*,"skipped":[0-9]*,"pct":[0-9.]*' | grep -o 'pct":[0-9.]*' | cut -d':' -f2 || echo "0")
+            STATEMENTS=$(cat coverage/coverage-summary.json | grep -o '"statements":{"total":[0-9]*,"covered":[0-9]*,"skipped":[0-9]*,"pct":[0-9.]*' | grep -o 'pct":[0-9.]*' | cut -d':' -f2 || echo "0")
+            FUNCTIONS=$(cat coverage/coverage-summary.json | grep -o '"functions":{"total":[0-9]*,"covered":[0-9]*,"skipped":[0-9]*,"pct":[0-9.]*' | grep -o 'pct":[0-9.]*' | cut -d':' -f2 || echo "0")
+            BRANCHES=$(cat coverage/coverage-summary.json | grep -o '"branches":{"total":[0-9]*,"covered":[0-9]*,"skipped":[0-9]*,"pct":[0-9.]*' | grep -o 'pct":[0-9.]*' | cut -d':' -f2 || echo "0")
+            echo "COVERAGE_LINES=${LINES}" >> $GITHUB_ENV
+            echo "COVERAGE_STATEMENTS=${STATEMENTS}" >> $GITHUB_ENV
+            echo "COVERAGE_FUNCTIONS=${FUNCTIONS}" >> $GITHUB_ENV
+            echo "COVERAGE_BRANCHES=${BRANCHES}" >> $GITHUB_ENV
+          else
+            echo "COVERAGE_AVAILABLE=false" >> $GITHUB_ENV
+          fi
+        continue-on-error: true
+
+      - name: Upload Coverage Artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-report
+          path: coverage/
+          retention-days: 30
+
+      - name: Post Test Coverage Report
+        uses: actions/github-script@v7
+        if: always()
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const testStatus = process.env.TEST_STATUS || '⚠️ Unknown';
+            const testOutput = process.env.TEST_OUTPUT || 'No output captured';
+            const coverageAvailable = process.env.COVERAGE_AVAILABLE === 'true';
+            
+            let coverageSection = '';
+            if (coverageAvailable) {
+              const lines = process.env.COVERAGE_LINES || '0';
+              const statements = process.env.COVERAGE_STATEMENTS || '0';
+              const functions = process.env.COVERAGE_FUNCTIONS || '0';
+              const branches = process.env.COVERAGE_BRANCHES || '0';
+              
+              coverageSection = `
+            ### Coverage Summary
+            | Metric | Coverage |
+            |--------|----------|
+            | Lines | ${lines}% |
+            | Statements | ${statements}% |
+            | Functions | ${functions}% |
+            | Branches | ${branches}% |
+            `;
+            } else {
+              coverageSection = '\n**Coverage data not available**\n';
+            }
+            
+            const body = `## 🧪 Test Coverage Report
+            
+            **Test Status:** ${testStatus}
+            ${coverageSection}
+            
+            <details>
+            <summary>View Test Output</summary>
+            
+            \`\`\`
+            ${testOutput}
+            \`\`\`
+            </details>
+            
+            ---
+            *Coverage artifacts uploaded for detailed analysis*
+            `;
+            
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: body
+            });
+
+  security-scan:
+    name: security-scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run npm audit for Vulnerabilities
+        id: npm-audit
+        run: |
+          echo "AUDIT_OUTPUT<<EOF" >> $GITHUB_ENV
+          npm audit --json > audit-report.json 2>&1 || true
+          npm audit 2>&1 | tee audit-output.txt || true
+          cat audit-output.txt >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+          
+          # Check if vulnerabilities exist
+          VULN_COUNT=$(cat audit-report.json | grep -o '"vulnerabilities":{[^}]*}' | grep -o '"total":[0-9]*' | cut -d':' -f2 || echo "0")
+          echo "VULNERABILITY_COUNT=${VULN_COUNT}" >> $GITHUB_ENV
+          
+          if [ "$VULN_COUNT" -eq "0" ]; then
+            echo "AUDIT_STATUS=✅ No vulnerabilities found" >> $GITHUB_ENV
+          else
+            echo "AUDIT_STATUS=⚠️ Found ${VULN_COUNT} vulnerabilities" >> $GITHUB_ENV
+          fi
+        continue-on-error: true
+
+      - name: Check Dependencies for Issues
+        id: dep-check
+        run: |
+          echo "DEPS_OUTPUT<<EOF" >> $GITHUB_ENV
+          npm ls --depth=0 2>&1 | tee deps-output.txt || true
+          cat deps-output.txt >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+          npm ls --depth=0 && echo "DEPS_STATUS=✅ All dependencies resolved" >> $GITHUB_ENV || echo "DEPS_STATUS=⚠️ Dependency issues detected" >> $GITHUB_ENV
+        continue-on-error: true
+
+      - name: Scan for Secrets in Code Changes
+        id: secret-scan
+        run: |
+          echo "SECRET_SCAN_OUTPUT<<EOF" >> $GITHUB_ENV
+          # Simple pattern-based secret detection
+          echo "Scanning for potential secrets in code changes..." >> $GITHUB_ENV
+          
+          # Check for common secret patterns
+          SECRET_PATTERNS="(password|passwd|pwd|secret|token|api_key|apikey|access_key|private_key|credentials)"
+          
+          # Scan modified files
+          if git diff origin/main...HEAD | grep -iE "$SECRET_PATTERNS" > secret-scan.txt 2>&1 || true; then
+            if [ -s secret-scan.txt ]; then
+              echo "⚠️ Potential secrets detected in code changes" >> $GITHUB_ENV
+              cat secret-scan.txt >> $GITHUB_ENV
+              echo "SECRET_SCAN_STATUS=⚠️ Potential secrets found" >> $GITHUB_ENV
+            else
+              echo "✅ No secrets detected" >> $GITHUB_ENV
+              echo "SECRET_SCAN_STATUS=✅ No secrets detected" >> $GITHUB_ENV
+            fi
+          else
+            echo "✅ No secrets detected" >> $GITHUB_ENV
+            echo "SECRET_SCAN_STATUS=✅ No secrets detected" >> $GITHUB_ENV
+          fi
+          echo "EOF" >> $GITHUB_ENV
+        continue-on-error: true
+
+      - name: Post Security Scan Report
+        uses: actions/github-script@v7
+        if: always()
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const auditStatus = process.env.AUDIT_STATUS || '⚠️ Unknown';
+            const auditOutput = process.env.AUDIT_OUTPUT || 'No output captured';
+            const depsStatus = process.env.DEPS_STATUS || '⚠️ Unknown';
+            const depsOutput = process.env.DEPS_OUTPUT || 'No output captured';
+            const secretScanStatus = process.env.SECRET_SCAN_STATUS || '⚠️ Unknown';
+            const secretScanOutput = process.env.SECRET_SCAN_OUTPUT || 'No output captured';
+            const vulnCount = process.env.VULNERABILITY_COUNT || '0';
+            
+            const body = `## 🔒 Security Scan Report
+            
+            ### Vulnerabilities Check
+            **Status:** ${auditStatus}
+            **Total Vulnerabilities Found:** ${vulnCount}
+            
+            <details>
+            <summary>View Vulnerability Report</summary>
+            
+            \`\`\`
+            ${auditOutput}
+            \`\`\`
+            </details>
+            
+            ### Dependencies Health
+            **Status:** ${depsStatus}
+            
+            <details>
+            <summary>View Dependencies</summary>
+            
+            \`\`\`
+            ${depsOutput}
+            \`\`\`
+            </details>
+            
+            ### Secret Scanning
+            **Status:** ${secretScanStatus}
+            
+            <details>
+            <summary>View Secret Scan Results</summary>
+            
+            \`\`\`
+            ${secretScanOutput}
+            \`\`\`
+            </details>
+            
+            ---
+            *Automated security scanning completed*
+            `;
+            
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: body
+            });
+
+  build-validation:
+    name: build-validation
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build Application
+        id: build
+        run: |
+          echo "BUILD_OUTPUT<<EOF" >> $GITHUB_ENV
+          npm run build 2>&1 | tee build-output.txt || true
+          cat build-output.txt >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+          npm run build && echo "BUILD_STATUS=✅ Success" >> $GITHUB_ENV || echo "BUILD_STATUS=❌ Failed" >> $GITHUB_ENV
+        continue-on-error: true
+
+      - name: Start Application for Validation
+        id: start-app
+        run: |
+          npm start &
+          APP_PID=$!
+          echo "APP_PID=${APP_PID}" >> $GITHUB_ENV
+          
+          # Wait for app to start
+          echo "Waiting for application to start..."
+          sleep 5
+          
+          # Check if process is running
+          if ps -p $APP_PID > /dev/null; then
+            echo "APP_START_STATUS=✅ Application started successfully" >> $GITHUB_ENV
+          else
+            echo "APP_START_STATUS=❌ Application failed to start" >> $GITHUB_ENV
+          fi
+        continue-on-error: true
+
+      - name: Validate Endpoints
+        id: validate-endpoints
+        run: |
+          echo "ENDPOINT_VALIDATION<<EOF" >> $GITHUB_ENV
+          
+          # Test health endpoint
+          echo "Testing /health endpoint..." | tee -a endpoint-validation.txt
+          if curl -f -s http://localhost:3000/health > /dev/null 2>&1; then
+            echo "✅ /health - Accessible" | tee -a endpoint-validation.txt
+            HEALTH_STATUS="✅"
+          else
+            echo "❌ /health - Not accessible" | tee -a endpoint-validation.txt
+            HEALTH_STATUS="❌"
+          fi
+          
+          # Test root endpoint
+          echo "Testing / endpoint..." | tee -a endpoint-validation.txt
+          if curl -f -s http://localhost:3000/ > /dev/null 2>&1; then
+            echo "✅ / - Accessible" | tee -a endpoint-validation.txt
+            ROOT_STATUS="✅"
+          else
+            echo "❌ / - Not accessible" | tee -a endpoint-validation.txt
+            ROOT_STATUS="❌"
+          fi
+          
+          cat endpoint-validation.txt >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+          
+          if [ "$HEALTH_STATUS" = "✅" ] && [ "$ROOT_STATUS" = "✅" ]; then
+            echo "ENDPOINT_STATUS=✅ All endpoints accessible" >> $GITHUB_ENV
+          else
+            echo "ENDPOINT_STATUS=⚠️ Some endpoints not accessible" >> $GITHUB_ENV
+          fi
+        continue-on-error: true
+
+      - name: Stop Application
+        if: always()
+        run: |
+          if [ ! -z "$APP_PID" ]; then
+            kill $APP_PID 2>/dev/null || true
+          fi
+          # Cleanup any remaining node processes
+          pkill -f "node src/app.js" || true
+
+      - name: Create Deployment Preview Artifacts
+        if: always()
+        run: |
+          mkdir -p deployment-preview
+          echo "Build Timestamp: $(date)" > deployment-preview/build-info.txt
+          echo "Node Version: $(node --version)" >> deployment-preview/build-info.txt
+          echo "NPM Version: $(npm --version)" >> deployment-preview/build-info.txt
+          echo "Commit SHA: ${{ github.sha }}" >> deployment-preview/build-info.txt
+          cp -r src deployment-preview/ 2>/dev/null || true
+          cp package.json deployment-preview/ 2>/dev/null || true
+
+      - name: Upload Deployment Preview Artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: deployment-preview
+          path: deployment-preview/
+          retention-days: 7
+
+      - name: Post Build Validation Report
+        uses: actions/github-script@v7
+        if: always()
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const buildStatus = process.env.BUILD_STATUS || '⚠️ Unknown';
+            const buildOutput = process.env.BUILD_OUTPUT || 'No output captured';
+            const appStartStatus = process.env.APP_START_STATUS || '⚠️ Unknown';
+            const endpointStatus = process.env.ENDPOINT_STATUS || '⚠️ Unknown';
+            const endpointValidation = process.env.ENDPOINT_VALIDATION || 'No validation data';
+            
+            const body = `## 🏗️ Build Validation
+            
+            ### Build Status
+            **Status:** ${buildStatus}
+            
+            <details>
+            <summary>View Build Output</summary>
+            
+            \`\`\`
+            ${buildOutput}
+            \`\`\`
+            </details>
+            
+            ### Application Start
+            **Status:** ${appStartStatus}
+            
+            ### Endpoint Validation
+            **Status:** ${endpointStatus}
+            
+            <details>
+            <summary>View Endpoint Validation Results</summary>
+            
+            \`\`\`
+            ${endpointValidation}
+            \`\`\`
+            </details>
+            
+            ### Deployment Preview
+            📦 Deployment preview artifacts have been created and uploaded
+            
+            ---
+            *Build validation and endpoint testing completed*
+            `;
+            
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: body
+            });
